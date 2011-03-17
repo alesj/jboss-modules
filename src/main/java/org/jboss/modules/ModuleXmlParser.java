@@ -34,10 +34,12 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.jar.JarFile;
@@ -65,6 +67,7 @@ import static javax.xml.stream.XMLStreamConstants.START_ELEMENT;
  *
  * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
  * @author thomas.diesler@jboss.com
+ * @author <a href="mailto:ales.justin@jboss.org">Ales Justin</a>
  */
 final class ModuleXmlParser {
 
@@ -234,6 +237,26 @@ final class ModuleXmlParser {
             }
         } catch (XMLStreamException e) {
             throw new ModuleLoadException("Error loading module from " + moduleInfoFile.getPath(), e);
+        }
+    }
+
+    static List<String> parseResourcePaths(final InputStream source, ModuleIdentifier mi) throws ModuleLoadException {
+        try {
+            final XMLInputFactory inputFactory = INPUT_FACTORY;
+            setIfSupported(inputFactory, XMLInputFactory.IS_VALIDATING, Boolean.FALSE);
+            setIfSupported(inputFactory, XMLInputFactory.SUPPORT_DTD, Boolean.FALSE);
+            final XMLStreamReader streamReader = inputFactory.createXMLStreamReader(source);
+            try {
+                List<String> resourcePaths = new ArrayList<String>();
+                parseResourcePaths(streamReader, resourcePaths);
+                return resourcePaths;
+            } finally {
+                safeClose(streamReader);
+            }
+        } catch (XMLStreamException e) {
+            throw new ModuleLoadException("Error reading resource paths: " + mi, e);
+        } finally {
+            safeClose(source);
         }
     }
 
@@ -501,6 +524,26 @@ final class ModuleXmlParser {
         throw endOfDocument(reader.getLocation());
     }
 
+    private static void parseResourcePaths(final XMLStreamReader reader, List<String> resourcePaths) throws XMLStreamException {
+        while (reader.hasNext()) {
+            switch (reader.nextTag()) {
+                case START_ELEMENT: {
+                    if (Element.of(reader.getName()) != Element.MODULE) {
+                        throw unexpectedContent(reader);
+                    }
+                    parseModuleContents(reader, resourcePaths);
+                    parseEndDocument(reader);
+                    return;
+                }
+                case END_ELEMENT: break;
+                default: {
+                    throw unexpectedContent(reader);
+                }
+            }
+        }
+        throw endOfDocument(reader.getLocation());
+    }
+
     private static void parseRootElement(final File root, final XMLStreamReader reader, final ModuleSpec.Builder specBuilder) throws XMLStreamException {
         while (reader.hasNext()) {
             switch (reader.nextTag()) {
@@ -562,6 +605,58 @@ final class ModuleXmlParser {
                         case RESOURCES:    parseResources(root, reader, specBuilder); break;
                         default: throw unexpectedContent(reader);
                     }
+                    break;
+                }
+                default: {
+                    throw unexpectedContent(reader);
+                }
+            }
+        }
+        throw endOfDocument(reader.getLocation());
+    }
+
+    private static void parseModuleContents(final XMLStreamReader reader, final List<String> resourcePaths) throws XMLStreamException {
+        Set<Element> visited = EnumSet.noneOf(Element.class);
+        while (reader.hasNext()) {
+            switch (reader.nextTag()) {
+                case END_ELEMENT: {
+                    return;
+                }
+                case START_ELEMENT: {
+                    final Element element = Element.of(reader.getName());
+                    if (visited.contains(element)) {
+                        throw unexpectedContent(reader);
+                    }
+                    visited.add(element);
+                    switch (element) {
+                        case EXPORTS:      skipElement(reader); break;
+                        case DEPENDENCIES: skipElement(reader); break;
+                        case MAIN_CLASS:   skipElement(reader); break;
+                        case RESOURCES:    parseResources(reader, resourcePaths); break;
+                        default: throw unexpectedContent(reader);
+                    }
+                    break;
+                }
+                default: {
+                    throw unexpectedContent(reader);
+                }
+            }
+        }
+        throw endOfDocument(reader.getLocation());
+    }
+
+    private static void skipElement(final XMLStreamReader reader) throws XMLStreamException {
+        String name = reader.getLocalName();
+        // xsd:choice
+        while (reader.hasNext()) {
+            switch (reader.nextTag()) {
+                case END_ELEMENT: {
+                    if (name != null && name.equals(reader.getLocalName()))
+                        return;
+                    else
+                        break;
+                }
+                case START_ELEMENT: {
                     break;
                 }
                 default: {
@@ -704,6 +799,71 @@ final class ModuleXmlParser {
             }
         }
         throw endOfDocument(reader.getLocation());
+    }
+
+    private static void parseResources(final XMLStreamReader reader, final List<String> resourcePaths) throws XMLStreamException {
+        // xsd:choice
+        while (reader.hasNext()) {
+            switch (reader.nextTag()) {
+                case END_ELEMENT: {
+                    return;
+                }
+                case START_ELEMENT: {
+                    switch (Element.of(reader.getName())) {
+                        case RESOURCE_ROOT: {
+                            parseResourceRoot(reader, resourcePaths);
+                            break;
+                        }
+                        default: throw unexpectedContent(reader);
+                    }
+                    break;
+                }
+                default: {
+                    throw unexpectedContent(reader);
+                }
+            }
+        }
+        throw endOfDocument(reader.getLocation());
+    }
+
+    private static void parseResourceRoot(final XMLStreamReader reader, final List<String> resourcePaths) throws XMLStreamException {
+        String path = null;
+        final Set<Attribute> required = EnumSet.of(Attribute.PATH);
+        final int count = reader.getAttributeCount();
+        for (int i = 0; i < count; i ++) {
+            final Attribute attribute = Attribute.of(reader.getAttributeName(i));
+            required.remove(attribute);
+            switch (attribute) {
+                case NAME: break;
+                case PATH: path = reader.getAttributeValue(i); break;
+                default: throw unexpectedContent(reader);
+            }
+        }
+        if (! required.isEmpty()) {
+            throw missingAttributes(reader.getLocation(), required);
+        }
+
+        final Set<Element> encountered = EnumSet.noneOf(Element.class);
+        while (reader.hasNext()) {
+            switch (reader.nextTag()) {
+                case END_ELEMENT: {
+                    resourcePaths.add(path);
+                    return;
+                }
+                case START_ELEMENT: {
+                    final Element element = Element.of(reader.getName());
+                    if (! encountered.add(element)) throw unexpectedContent(reader);
+                    switch (element) {
+                        case FILTER: skipElement(reader); break;
+                        default: throw unexpectedContent(reader);
+                    }
+                    break;
+                }
+                default: {
+                    throw unexpectedContent(reader);
+                }
+            }
+        }
     }
 
     private static void parseResourceRoot(final File root, final XMLStreamReader reader, final ModuleSpec.Builder specBuilder) throws XMLStreamException {
@@ -893,6 +1053,5 @@ final class ModuleXmlParser {
                 }
             }
         }
-        return;
     }
 }
